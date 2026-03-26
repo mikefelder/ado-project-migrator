@@ -129,10 +129,10 @@ if ($useSqlAuth) {
     $plainPwd = [System.Runtime.InteropServices.Marshal]::PtrToStringBSTR(
         [System.Runtime.InteropServices.Marshal]::SecureStringToBSTR($password)
     )
-    $connString = "Server=$serverName;User Id=$username;Password=$plainPwd;TrustServerCertificate=True;Connection Timeout=15;"
+    $connString = "Server=$serverName;User Id=$username;Password=$plainPwd;Encrypt=Optional;TrustServerCertificate=True;Connection Timeout=15;"
 }
 else {
-    $connString = "Server=$serverName;Integrated Security=True;TrustServerCertificate=True;Connection Timeout=15;"
+    $connString = "Server=$serverName;Integrated Security=True;Encrypt=Optional;TrustServerCertificate=True;Connection Timeout=15;"
 }
 
 # Query for databases
@@ -248,6 +248,7 @@ else {
     # No extra args needed — SqlPackage uses Windows auth by default
 }
 
+$spArgs += "/SourceEncryptConnection:Optional"
 $spArgs += "/SourceTrustServerCertificate:True"
 $spArgs += "/p:VerifyExtraction=True"
 
