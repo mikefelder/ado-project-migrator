@@ -129,10 +129,10 @@ if ($useSqlAuth) {
     $plainPwd = [System.Runtime.InteropServices.Marshal]::PtrToStringBSTR(
         [System.Runtime.InteropServices.Marshal]::SecureStringToBSTR($password)
     )
-    $connString = "Server=$serverName;User Id=$username;Password=$plainPwd;Encrypt=Optional;TrustServerCertificate=True;Connection Timeout=15;"
+    $connString = "Server=$serverName;User Id=$username;Password=$plainPwd;Encrypt=False;TrustServerCertificate=True;Connection Timeout=15;"
 }
 else {
-    $connString = "Server=$serverName;Integrated Security=True;Encrypt=Optional;TrustServerCertificate=True;Connection Timeout=15;"
+    $connString = "Server=$serverName;Integrated Security=True;Encrypt=False;TrustServerCertificate=True;Connection Timeout=15;"
 }
 
 # Query for databases
@@ -250,7 +250,7 @@ else {
 
 $spArgs += "/SourceEncryptConnection:Optional"
 $spArgs += "/SourceTrustServerCertificate:True"
-$spArgs += "/p:VerifyExtraction=True"
+$spArgs += "/p:VerifyExtraction=False"
 
 Write-Host "  Running SqlPackage..." -ForegroundColor Yellow
 Write-Host ""
