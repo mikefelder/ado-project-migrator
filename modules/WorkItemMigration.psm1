@@ -17,7 +17,9 @@ function Copy-AreaTree {
         [string]$SourceProject,
 
         [Parameter(Mandatory)]
-        [string]$DestProject
+        [string]$DestProject,
+
+        [switch]$DryRun
     )
 
     Write-MigrationLog -Message "  Migrating area paths..." -Level "INFO"
@@ -30,6 +32,11 @@ function Copy-AreaTree {
 
     $count = 0
     if ($areaTree.children) {
+        if ($DryRun) {
+            $count = ($areaTree.children | Measure-Object).Count
+            Write-MigrationLog -Message "  [DRY RUN] Would migrate $count top-level area node(s) (plus children)." -Level "DEBUG"
+            return $count
+        }
         $count = Copy-ClassificationNodes -Nodes $areaTree.children -Destination $Destination -DestProject $dstEncoded -NodeType "areas" -ParentPath ""
     }
 
@@ -50,7 +57,9 @@ function Copy-IterationTree {
         [string]$SourceProject,
 
         [Parameter(Mandatory)]
-        [string]$DestProject
+        [string]$DestProject,
+
+        [switch]$DryRun
     )
 
     Write-MigrationLog -Message "  Migrating iteration paths..." -Level "INFO"
@@ -63,6 +72,11 @@ function Copy-IterationTree {
 
     $count = 0
     if ($iterTree.children) {
+        if ($DryRun) {
+            $count = ($iterTree.children | Measure-Object).Count
+            Write-MigrationLog -Message "  [DRY RUN] Would migrate $count top-level iteration node(s) (plus children)." -Level "DEBUG"
+            return $count
+        }
         $count = Copy-ClassificationNodes -Nodes $iterTree.children -Destination $Destination -DestProject $dstEncoded -NodeType "iterations" -ParentPath ""
     }
 
@@ -151,7 +165,11 @@ function Copy-WorkItems {
         [string]$SourceProject,
 
         [Parameter(Mandatory)]
-        [string]$DestProject
+        [string]$DestProject,
+
+        [hashtable]$IdentityMap,
+
+        [switch]$DryRun
     )
 
     Write-MigrationLog -Message "  Migrating work items..." -Level "INFO"
@@ -175,6 +193,11 @@ function Copy-WorkItems {
 
     Write-MigrationLog -Message "  Found $($workItemIds.Count) work item(s) to migrate." -Level "INFO"
 
+    if ($DryRun) {
+        Write-MigrationLog -Message "  [DRY RUN] Would migrate $($workItemIds.Count) work item(s)." -Level "DEBUG"
+        return @{ Migrated = $workItemIds.Count; Failed = 0; IdMap = @{} }
+    }
+
     # Process in batches of 200
     $idMap = @{}        # oldId -> newId
     $migrated = 0
@@ -192,7 +215,8 @@ function Copy-WorkItems {
         foreach ($item in $items.value) {
             try {
                 $newId = Copy-SingleWorkItem -Item $item -Source $Source -Destination $Destination `
-                    -SourceProject $SourceProject -DestProject $DestProject -IdMap $idMap
+                    -SourceProject $SourceProject -DestProject $DestProject -IdMap $idMap `
+                    -IdentityMap $IdentityMap
 
                 if ($newId) {
                     $idMap[$item.id] = $newId
@@ -246,7 +270,9 @@ function Copy-SingleWorkItem {
         [Parameter(Mandatory)]
         [string]$DestProject,
 
-        [hashtable]$IdMap = @{}
+        [hashtable]$IdMap = @{},
+
+        [hashtable]$IdentityMap
     )
 
     $dstEncoded = [Uri]::EscapeDataString($DestProject)
@@ -280,9 +306,20 @@ function Copy-SingleWorkItem {
         $value = $Item.fields.$field
         if ($null -ne $value -and $value -ne '') {
             # Rewrite project-scoped paths
-            if ($field -eq 'System.AssignedTo' -and $value -is [hashtable]) {
-                # Skip identity fields that may not resolve across orgs
-                continue
+            if ($field -eq 'System.AssignedTo') {
+                if ($IdentityMap -and $value) {
+                    $sourceIdentity = if ($value -is [hashtable]) { $value.uniqueName } else { $value }
+                    $resolved = Resolve-DestinationIdentity -SourceIdentity $sourceIdentity -IdentityMap $IdentityMap
+                    if ($resolved) {
+                        $value = $resolved
+                    }
+                    else {
+                        continue  # No mapping found — skip to avoid identity resolution errors
+                    }
+                }
+                elseif ($value -is [hashtable]) {
+                    continue  # Skip identity fields that may not resolve across orgs
+                }
             }
             $patchDoc.Add(@{
                 op    = "add"
@@ -345,7 +382,74 @@ function Copy-SingleWorkItem {
     $result = Invoke-RestMethod -Uri $url -Headers $Destination.AuthHeader -Method Post `
         -Body $body -ContentType "application/json-patch+json" -ErrorAction Stop
 
+    # Migrate attachments
+    if ($Item.relations) {
+        $attachments = $Item.relations | Where-Object { $_.rel -eq "AttachedFile" }
+        if ($attachments) {
+            Copy-WorkItemAttachments -Attachments $attachments -Source $Source `
+                -Destination $Destination -NewWorkItemId $result.id
+        }
+    }
+
     return $result.id
+}
+
+function Copy-WorkItemAttachments {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [array]$Attachments,
+
+        [Parameter(Mandatory)]
+        [hashtable]$Source,
+
+        [Parameter(Mandatory)]
+        [hashtable]$Destination,
+
+        [Parameter(Mandatory)]
+        [int]$NewWorkItemId
+    )
+
+    foreach ($attachment in $Attachments) {
+        try {
+            $fileName = $attachment.attributes.name
+            if (-not $fileName) { $fileName = "attachment" }
+
+            # Download from source
+            $downloadUrl = $attachment.url
+            $tempFile = [System.IO.Path]::GetTempFileName()
+            try {
+                Invoke-RestMethod -Uri $downloadUrl -Headers $Source.AuthHeader -OutFile $tempFile -ErrorAction Stop
+
+                # Upload to destination
+                $encodedName = [Uri]::EscapeDataString($fileName)
+                $uploadUrl = "$($Destination.BaseUrl)/_apis/wit/attachments?fileName=$encodedName&api-version=$($Destination.ApiVersion)"
+                $fileBytes = [System.IO.File]::ReadAllBytes($tempFile)
+                $uploadResult = Invoke-RestMethod -Uri $uploadUrl -Headers $Destination.AuthHeader `
+                    -Method Post -Body $fileBytes -ContentType "application/octet-stream" -ErrorAction Stop
+
+                # Attach to work item
+                $patchDoc = @(@{
+                    op    = "add"
+                    path  = "/relations/-"
+                    value = @{
+                        rel        = "AttachedFile"
+                        url        = $uploadResult.url
+                        attributes = @{ name = $fileName }
+                    }
+                })
+                $wiUrl = "$($Destination.BaseUrl)/_apis/wit/workitems/$NewWorkItemId`?api-version=$($Destination.ApiVersion)"
+                Invoke-RestMethod -Uri $wiUrl -Headers $Destination.AuthHeader -Method Patch `
+                    -Body ($patchDoc | ConvertTo-Json -Depth 10) -ContentType "application/json-patch+json" -ErrorAction Stop | Out-Null
+            }
+            finally {
+                if (Test-Path $tempFile) { Remove-Item $tempFile -Force }
+            }
+        }
+        catch {
+            Write-MigrationLog -Message "      Could not migrate attachment '$($attachment.attributes.name)': $_" -Level "WARN"
+        }
+    }
 }
 
 function Restore-WorkItemLinks {

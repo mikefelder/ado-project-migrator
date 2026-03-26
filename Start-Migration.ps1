@@ -23,7 +23,9 @@
 param(
     [switch]$SkipRepoMigration,
     [switch]$SkipWorkItemMigration,
-    [switch]$SkipPipelineMigration
+    [switch]$SkipPipelineMigration,
+    [switch]$DryRun,
+    [string]$IdentityMapPath
 )
 
 $ErrorActionPreference = "Stop"
@@ -31,18 +33,26 @@ $ErrorActionPreference = "Stop"
 # ── Import modules ───────────────────────────────────────────────────────────
 $modulePath = Join-Path $PSScriptRoot "modules"
 
-Import-Module (Join-Path $modulePath "Logging.psm1")        -Force -DisableNameChecking
-Import-Module (Join-Path $modulePath "Connection.psm1")      -Force -DisableNameChecking
-Import-Module (Join-Path $modulePath "ProjectDiscovery.psm1") -Force -DisableNameChecking
-Import-Module (Join-Path $modulePath "InteractiveUI.psm1")   -Force -DisableNameChecking
-Import-Module (Join-Path $modulePath "WorkItemMigration.psm1") -Force -DisableNameChecking
-Import-Module (Join-Path $modulePath "RepoMigration.psm1")   -Force -DisableNameChecking
-Import-Module (Join-Path $modulePath "PipelineMigration.psm1") -Force -DisableNameChecking
-Import-Module (Join-Path $modulePath "MigrationEngine.psm1") -Force -DisableNameChecking
+Import-Module (Join-Path $modulePath "Logging.psm1")           -Force -DisableNameChecking
+Import-Module (Join-Path $modulePath "Connection.psm1")         -Force -DisableNameChecking
+Import-Module (Join-Path $modulePath "ProjectDiscovery.psm1")   -Force -DisableNameChecking
+Import-Module (Join-Path $modulePath "InteractiveUI.psm1")      -Force -DisableNameChecking
+Import-Module (Join-Path $modulePath "WorkItemMigration.psm1")  -Force -DisableNameChecking
+Import-Module (Join-Path $modulePath "RepoMigration.psm1")      -Force -DisableNameChecking
+Import-Module (Join-Path $modulePath "PipelineMigration.psm1")  -Force -DisableNameChecking
+Import-Module (Join-Path $modulePath "MigrationEngine.psm1")    -Force -DisableNameChecking
+Import-Module (Join-Path $modulePath "IdentityMapping.psm1")    -Force -DisableNameChecking
+Import-Module (Join-Path $modulePath "ProcessValidation.psm1")  -Force -DisableNameChecking
+Import-Module (Join-Path $modulePath "QueryMigration.psm1")     -Force -DisableNameChecking
 
 # ── Initialize ───────────────────────────────────────────────────────────────
 $logFile = Initialize-MigrationLog
 Show-Banner
+
+if ($DryRun) {
+    Write-Host "  *** DRY RUN MODE — No changes will be made ***" -ForegroundColor Magenta
+    Write-Host ""
+}
 
 Write-Host "  This tool will guide you through migrating projects from" -ForegroundColor White
 Write-Host "  Azure DevOps Server 2022 (on-prem) to Azure DevOps Services (cloud)." -ForegroundColor White
@@ -123,26 +133,46 @@ if (-not $migrationPlan -or $migrationPlan.Count -eq 0) {
     exit 0
 }
 
-# ── Step 6: Confirm ─────────────────────────────────────────────────────────
+# ── Step 6: Identity Mapping (optional) ──────────────────────────────────────
+$identityMap = $null
+if ($IdentityMapPath) {
+    $identityMap = Import-IdentityMap -CsvPath $IdentityMapPath
+    Write-MigrationLog -Message "Loaded $($identityMap.Count) identity mapping(s) from file." -Level "INFO"
+}
+else {
+    $identityMap = Request-IdentityMapSetup
+    if ($identityMap -and $identityMap.Count -gt 0) {
+        Write-MigrationLog -Message "Loaded $($identityMap.Count) identity mapping(s)." -Level "INFO"
+    }
+}
+
+# ── Step 7: Confirm ─────────────────────────────────────────────────────────
 $confirmed = Confirm-MigrationPlan -Plan $migrationPlan
 if (-not $confirmed) {
     Write-MigrationLog -Message "Migration cancelled by user." -Level "WARN"
     exit 0
 }
 
-# ── Step 7: Execute Migration ───────────────────────────────────────────────
-Write-MigrationLog -Message "Step 7: Starting migration..." -Level "INFO"
+# ── Step 8: Execute Migration ───────────────────────────────────────────────
+$modeMsg = if ($DryRun) { "Starting DRY RUN migration..." } else { "Starting migration..." }
+Write-MigrationLog -Message "Step 8: $modeMsg" -Level "INFO"
 Write-Host ""
 
 $results = @()
 
 foreach ($entry in $migrationPlan) {
-    $result = Start-ProjectMigration -Source $source -PlanEntry $entry
+    $migParams = @{
+        Source    = $source
+        PlanEntry = $entry
+        DryRun    = $DryRun
+    }
+    if ($identityMap) { $migParams["IdentityMap"] = $identityMap }
+    $result = Start-ProjectMigration @migParams
     $results += $result
 }
 
-# ── Step 8: Report ──────────────────────────────────────────────────────────
-Write-MigrationLog -Message "Step 8: Generating migration report..." -Level "INFO"
+# ── Step 9: Report ──────────────────────────────────────────────────────────
+Write-MigrationLog -Message "Step 9: Generating migration report..." -Level "INFO"
 
 $reportFile = Write-MigrationReport -MigrationResults $results
 

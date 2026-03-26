@@ -173,8 +173,10 @@ function Build-MigrationPlan {
         # Select what to migrate
         $componentOptions = @(
             "Git Repositories (with full history)",
-            "Work Items (areas, iterations, items, links)",
+            "Work Items (areas, iterations, items, links, attachments)",
             "Build/Pipeline Definitions",
+            "Release Pipelines (classic)",
+            "Shared Queries",
             "All of the above"
         )
         $componentSelection = Show-Menu -Title "What should be migrated for '$($project.name)'?" -Options $componentOptions -MultiSelect
@@ -182,16 +184,22 @@ function Build-MigrationPlan {
         $migrateRepos = $false
         $migrateWorkItems = $false
         $migratePipelines = $false
+        $migrateReleases = $false
+        $migrateQueries = $false
 
-        if ($componentSelection -contains 3) {
+        if ($componentSelection -contains 5) {
             $migrateRepos = $true
             $migrateWorkItems = $true
             $migratePipelines = $true
+            $migrateReleases = $true
+            $migrateQueries = $true
         }
         else {
             $migrateRepos = $componentSelection -contains 0
             $migrateWorkItems = $componentSelection -contains 1
             $migratePipelines = $componentSelection -contains 2
+            $migrateReleases = $componentSelection -contains 3
+            $migrateQueries = $componentSelection -contains 4
         }
 
         $plan += @{
@@ -203,6 +211,8 @@ function Build-MigrationPlan {
             MigrateRepos      = $migrateRepos
             MigrateWorkItems  = $migrateWorkItems
             MigratePipelines  = $migratePipelines
+            MigrateReleases   = $migrateReleases
+            MigrateQueries    = $migrateQueries
         }
     }
 
@@ -227,6 +237,8 @@ function Confirm-MigrationPlan {
         if ($entry.MigrateRepos) { $components += "Repos" }
         if ($entry.MigrateWorkItems) { $components += "Work Items" }
         if ($entry.MigratePipelines) { $components += "Pipelines" }
+        if ($entry.MigrateReleases) { $components += "Releases" }
+        if ($entry.MigrateQueries) { $components += "Queries" }
 
         $action = if ($entry.MergeIntoExisting) { "MERGE INTO" } else { "CREATE/MIGRATE TO" }
 

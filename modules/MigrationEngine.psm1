@@ -11,7 +11,11 @@ function Start-ProjectMigration {
         [hashtable]$Source,
 
         [Parameter(Mandatory)]
-        [hashtable]$PlanEntry
+        [hashtable]$PlanEntry,
+
+        [hashtable]$IdentityMap,
+
+        [switch]$DryRun
     )
 
     $sourceProject = $PlanEntry.SourceProject
@@ -32,52 +36,58 @@ function Start-ProjectMigration {
 
     Write-MigrationLog -Message "" -Level "INFO"
     Write-MigrationLog -Message "══════════════════════════════════════════════════════════════" -Level "INFO"
-    Write-MigrationLog -Message "  Migrating: $sourceProject  ──►  $($destOrg.OrgName)/$destProject" -Level "INFO"
+    $modeLabel = if ($DryRun) { " [DRY RUN]" } else { "" }
+    Write-MigrationLog -Message "  Migrating$modeLabel`: $sourceProject  ──►  $($destOrg.OrgName)/$destProject" -Level "INFO"
     Write-MigrationLog -Message "══════════════════════════════════════════════════════════════" -Level "INFO"
 
     # Step 1: Ensure destination project exists
     if (-not $PlanEntry.MergeIntoExisting) {
-        Write-MigrationLog -Message "  Creating destination project '$destProject'..." -Level "INFO"
-        try {
-            # Check if project already exists
-            $existingCheck = $null
-            $checkUrl = "$($destOrg.BaseUrl)/_apis/projects/$([Uri]::EscapeDataString($destProject))?api-version=$($destOrg.ApiVersion)"
-            try {
-                $existingCheck = Invoke-AdoApi -Url $checkUrl -AuthHeader $destOrg.AuthHeader
-            }
-            catch { }
-
-            if ($existingCheck) {
-                Write-MigrationLog -Message "  Project '$destProject' already exists. Proceeding with migration into it." -Level "WARN"
-            }
-            else {
-                # Determine process template from source
-                $srcEncoded = [Uri]::EscapeDataString($sourceProject)
-                $srcProjUrl = "$($Source.BaseUrl)/_apis/projects/$srcEncoded`?includeCapabilities=true&api-version=$($Source.ApiVersion)"
-                $srcProjDetails = Invoke-AdoApi -Url $srcProjUrl -AuthHeader $Source.AuthHeader
-
-                $processName = "Agile" # Default fallback
-                if ($srcProjDetails.capabilities.processTemplate.templateName) {
-                    $processName = $srcProjDetails.capabilities.processTemplate.templateName
-                }
-
-                $created = New-AdoProject -BaseUrl $destOrg.BaseUrl -AuthHeader $destOrg.AuthHeader `
-                    -ProjectName $destProject -Description "Migrated from $sourceProject" `
-                    -ProcessTemplate $processName -ApiVersion $destOrg.ApiVersion
-
-                if (-not $created) {
-                    $result.Errors.Add("Failed to create destination project.") | Out-Null
-                    $stopwatch.Stop()
-                    $result.Duration = $stopwatch.Elapsed.ToString("hh\:mm\:ss")
-                    return $result
-                }
-            }
+        if ($DryRun) {
+            Write-MigrationLog -Message "  [DRY RUN] Would create destination project '$destProject'." -Level "DEBUG"
         }
-        catch {
-            $result.Errors.Add("Project creation error: $_") | Out-Null
-            $stopwatch.Stop()
-            $result.Duration = $stopwatch.Elapsed.ToString("hh\:mm\:ss")
-            return $result
+        else {
+            Write-MigrationLog -Message "  Creating destination project '$destProject'..." -Level "INFO"
+            try {
+                # Check if project already exists
+                $existingCheck = $null
+                $checkUrl = "$($destOrg.BaseUrl)/_apis/projects/$([Uri]::EscapeDataString($destProject))?api-version=$($destOrg.ApiVersion)"
+                try {
+                    $existingCheck = Invoke-AdoApi -Url $checkUrl -AuthHeader $destOrg.AuthHeader
+                }
+                catch { }
+
+                if ($existingCheck) {
+                    Write-MigrationLog -Message "  Project '$destProject' already exists. Proceeding with migration into it." -Level "WARN"
+                }
+                else {
+                    # Determine process template from source
+                    $srcEncoded = [Uri]::EscapeDataString($sourceProject)
+                    $srcProjUrl = "$($Source.BaseUrl)/_apis/projects/$srcEncoded`?includeCapabilities=true&api-version=$($Source.ApiVersion)"
+                    $srcProjDetails = Invoke-AdoApi -Url $srcProjUrl -AuthHeader $Source.AuthHeader
+
+                    $processName = "Agile" # Default fallback
+                    if ($srcProjDetails.capabilities.processTemplate.templateName) {
+                        $processName = $srcProjDetails.capabilities.processTemplate.templateName
+                    }
+
+                    $created = New-AdoProject -BaseUrl $destOrg.BaseUrl -AuthHeader $destOrg.AuthHeader `
+                        -ProjectName $destProject -Description "Migrated from $sourceProject" `
+                        -ProcessTemplate $processName -ApiVersion $destOrg.ApiVersion
+
+                    if (-not $created) {
+                        $result.Errors.Add("Failed to create destination project.") | Out-Null
+                        $stopwatch.Stop()
+                        $result.Duration = $stopwatch.Elapsed.ToString("hh\:mm\:ss")
+                        return $result
+                    }
+                }
+            }
+            catch {
+                $result.Errors.Add("Project creation error: $_") | Out-Null
+                $stopwatch.Stop()
+                $result.Duration = $stopwatch.Elapsed.ToString("hh\:mm\:ss")
+                return $result
+            }
         }
     }
 
@@ -91,16 +101,41 @@ function Start-ProjectMigration {
     $anySuccess = $false
     $anyFailure = $false
 
-    # Step 2: Migrate Work Items (areas, iterations, then items)
+    # Step 2: Process validation (pre-flight)
+    if ($PlanEntry.MigrateWorkItems -and -not $DryRun) {
+        try {
+            Write-MigrationLog -Message "  Running process template compatibility check..." -Level "INFO"
+            $validation = Test-ProcessCompatibility -Source $Source -Destination $destConn `
+                -SourceProject $sourceProject -DestProject $destProject
+            Show-ValidationReport -ValidationResult $validation
+            if (-not $validation.Valid) {
+                Write-MigrationLog -Message "  Process validation found issues. Work item migration may have failures." -Level "WARN"
+            }
+            $result.Details["ProcessValidation"] = if ($validation.Valid) { "Passed" } else { "$($validation.Issues.Count) issue(s)" }
+        }
+        catch {
+            Write-MigrationLog -Message "  Process validation error (non-blocking): $_" -Level "WARN"
+        }
+    }
+
+    # Step 3: Migrate Work Items (areas, iterations, then items)
     if ($PlanEntry.MigrateWorkItems) {
         try {
-            $areaCount = Copy-AreaTree -Source $Source -Destination $destConn -SourceProject $sourceProject -DestProject $destProject
+            $areaCount = Copy-AreaTree -Source $Source -Destination $destConn -SourceProject $sourceProject -DestProject $destProject -DryRun:$DryRun
             $result.Details["AreaNodes"] = $areaCount
 
-            $iterCount = Copy-IterationTree -Source $Source -Destination $destConn -SourceProject $sourceProject -DestProject $destProject
+            $iterCount = Copy-IterationTree -Source $Source -Destination $destConn -SourceProject $sourceProject -DestProject $destProject -DryRun:$DryRun
             $result.Details["IterationNodes"] = $iterCount
 
-            $wiResult = Copy-WorkItems -Source $Source -Destination $destConn -SourceProject $sourceProject -DestProject $destProject
+            $wiParams = @{
+                Source        = $Source
+                Destination   = $destConn
+                SourceProject = $sourceProject
+                DestProject   = $destProject
+                DryRun        = $DryRun
+            }
+            if ($IdentityMap) { $wiParams["IdentityMap"] = $IdentityMap }
+            $wiResult = Copy-WorkItems @wiParams
             $result.Details["WorkItemsMigrated"] = $wiResult.Migrated
             $result.Details["WorkItemsFailed"] = $wiResult.Failed
 
@@ -114,10 +149,10 @@ function Start-ProjectMigration {
         }
     }
 
-    # Step 3: Migrate Git Repositories
+    # Step 4: Migrate Git Repositories
     if ($PlanEntry.MigrateRepos) {
         try {
-            $repoResult = Copy-GitRepositories -Source $Source -Destination $destConn -SourceProject $sourceProject -DestProject $destProject
+            $repoResult = Copy-GitRepositories -Source $Source -Destination $destConn -SourceProject $sourceProject -DestProject $destProject -DryRun:$DryRun
             $result.Details["ReposMigrated"] = $repoResult.Migrated
             $result.Details["ReposFailed"] = $repoResult.Failed
 
@@ -131,10 +166,10 @@ function Start-ProjectMigration {
         }
     }
 
-    # Step 4: Migrate Build/Pipeline Definitions
+    # Step 5: Migrate Build/Pipeline Definitions
     if ($PlanEntry.MigratePipelines) {
         try {
-            $pipeResult = Copy-BuildDefinitions -Source $Source -Destination $destConn -SourceProject $sourceProject -DestProject $destProject
+            $pipeResult = Copy-BuildDefinitions -Source $Source -Destination $destConn -SourceProject $sourceProject -DestProject $destProject -DryRun:$DryRun
             $result.Details["PipelinesMigrated"] = $pipeResult.Migrated
             $result.Details["PipelinesSkipped"] = $pipeResult.Skipped
             $result.Details["PipelinesFailed"] = $pipeResult.Failed
@@ -145,6 +180,42 @@ function Start-ProjectMigration {
         catch {
             Write-MigrationLog -Message "  Pipeline migration error: $_" -Level "ERROR"
             $result.Errors.Add("Pipeline migration: $_") | Out-Null
+            $anyFailure = $true
+        }
+    }
+
+    # Step 6: Migrate Release Pipelines
+    if ($PlanEntry.MigrateReleases) {
+        try {
+            $relResult = Copy-ReleaseDefinitions -Source $Source -Destination $destConn `
+                -SourceProject $sourceProject -DestProject $destProject -DryRun:$DryRun
+            $result.Details["ReleasesMigrated"] = $relResult.Migrated
+            $result.Details["ReleasesFailed"] = $relResult.Failed
+
+            if ($relResult.Migrated -gt 0) { $anySuccess = $true }
+            if ($relResult.Failed -gt 0) { $anyFailure = $true }
+        }
+        catch {
+            Write-MigrationLog -Message "  Release pipeline migration error: $_" -Level "ERROR"
+            $result.Errors.Add("Release pipeline migration: $_") | Out-Null
+            $anyFailure = $true
+        }
+    }
+
+    # Step 7: Migrate Shared Queries
+    if ($PlanEntry.MigrateQueries) {
+        try {
+            $queryResult = Copy-SharedQueries -Source $Source -Destination $destConn `
+                -SourceProject $sourceProject -DestProject $destProject -DryRun:$DryRun
+            $result.Details["QueriesMigrated"] = $queryResult.Migrated
+            $result.Details["QueriesFailed"] = $queryResult.Failed
+
+            if ($queryResult.Migrated -gt 0) { $anySuccess = $true }
+            if ($queryResult.Failed -gt 0) { $anyFailure = $true }
+        }
+        catch {
+            Write-MigrationLog -Message "  Shared query migration error: $_" -Level "ERROR"
+            $result.Errors.Add("Query migration: $_") | Out-Null
             $anyFailure = $true
         }
     }

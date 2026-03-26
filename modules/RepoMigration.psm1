@@ -17,7 +17,9 @@ function Copy-GitRepositories {
         [string]$SourceProject,
 
         [Parameter(Mandatory)]
-        [string]$DestProject
+        [string]$DestProject,
+
+        [switch]$DryRun
     )
 
     Write-MigrationLog -Message "  Migrating Git repositories..." -Level "INFO"
@@ -41,6 +43,12 @@ function Copy-GitRepositories {
     }
 
     Write-MigrationLog -Message "  Found $($srcRepos.Count) repository/repositories." -Level "INFO"
+
+    if ($DryRun) {
+        $nonEmpty = ($srcRepos | Where-Object { $_.defaultBranch }).Count
+        Write-MigrationLog -Message "  [DRY RUN] Would migrate $nonEmpty non-empty repository/repositories." -Level "DEBUG"
+        return @{ Migrated = $nonEmpty; Failed = 0 }
+    }
 
     $migrated = 0
     $failed = 0

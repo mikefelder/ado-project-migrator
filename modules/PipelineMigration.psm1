@@ -17,7 +17,9 @@ function Copy-BuildDefinitions {
         [string]$SourceProject,
 
         [Parameter(Mandatory)]
-        [string]$DestProject
+        [string]$DestProject,
+
+        [switch]$DryRun
     )
 
     Write-MigrationLog -Message "  Migrating build/pipeline definitions..." -Level "INFO"
@@ -35,6 +37,11 @@ function Copy-BuildDefinitions {
     }
 
     Write-MigrationLog -Message "  Found $($srcDefs.Count) build definition(s)." -Level "INFO"
+
+    if ($DryRun) {
+        Write-MigrationLog -Message "  [DRY RUN] Would migrate $($srcDefs.Count) build definition(s)." -Level "DEBUG"
+        return @{ Migrated = $srcDefs.Count; Failed = 0; Skipped = 0 }
+    }
 
     # Get destination repos for mapping
     $dstRepoUrl = "$($Destination.BaseUrl)/$dstEncoded/_apis/git/repositories?api-version=$($Destination.ApiVersion)"
@@ -216,4 +223,199 @@ function Get-DestProjectIdForPipeline {
     return $project.id
 }
 
-Export-ModuleMember -Function Copy-BuildDefinitions
+function Copy-ReleaseDefinitions {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [hashtable]$Source,
+
+        [Parameter(Mandatory)]
+        [hashtable]$Destination,
+
+        [Parameter(Mandatory)]
+        [string]$SourceProject,
+
+        [Parameter(Mandatory)]
+        [string]$DestProject,
+
+        [switch]$DryRun
+    )
+
+    Write-MigrationLog -Message "  Migrating release definitions..." -Level "INFO"
+
+    $srcEncoded = [Uri]::EscapeDataString($SourceProject)
+    $dstEncoded = [Uri]::EscapeDataString($DestProject)
+
+    # Release Management uses vsrm subdomain for ADO Services, but same base for on-prem
+    $srcRmBase = Get-RmBaseUrl -BaseUrl $Source.BaseUrl
+    $dstRmBase = Get-RmBaseUrl -BaseUrl $Destination.BaseUrl
+
+    # Get source release definitions
+    $srcUrl = "$srcRmBase/$srcEncoded/_apis/release/definitions?api-version=$($Source.ApiVersion)"
+    $srcDefs = @()
+    try {
+        $srcDefs = (Invoke-AdoApi -Url $srcUrl -AuthHeader $Source.AuthHeader).value
+    }
+    catch {
+        Write-MigrationLog -Message "  Could not retrieve release definitions (API may not be available): $_" -Level "WARN"
+        return @{ Migrated = 0; Failed = 0; Skipped = 0 }
+    }
+
+    if ($srcDefs.Count -eq 0) {
+        Write-MigrationLog -Message "  No release definitions found." -Level "INFO"
+        return @{ Migrated = 0; Failed = 0; Skipped = 0 }
+    }
+
+    Write-MigrationLog -Message "  Found $($srcDefs.Count) release definition(s)." -Level "INFO"
+
+    $migrated = 0
+    $failed = 0
+    $skipped = 0
+
+    foreach ($defSummary in $srcDefs) {
+        $defName = $defSummary.name
+
+        try {
+            # Get full definition
+            $fullUrl = "$srcRmBase/$srcEncoded/_apis/release/definitions/$($defSummary.id)?api-version=$($Source.ApiVersion)"
+            $fullDef = Invoke-AdoApi -Url $fullUrl -AuthHeader $Source.AuthHeader
+
+            if ($DryRun) {
+                Write-MigrationLog -Message "    [DRY RUN] Would migrate release definition: '$defName' ($($fullDef.environments.Count) environment(s))" -Level "DEBUG"
+                $migrated++
+                continue
+            }
+
+            # Build the new definition
+            $newDef = Build-ReleaseDefinition -SourceDef $fullDef -SourceProject $SourceProject `
+                -DestProject $DestProject -Destination $Destination
+
+            if ($newDef) {
+                $createUrl = "$dstRmBase/$dstEncoded/_apis/release/definitions?api-version=$($Destination.ApiVersion)"
+                Invoke-AdoApi -Url $createUrl -AuthHeader $Destination.AuthHeader -Method "Post" -Body $newDef | Out-Null
+                Write-MigrationLog -Message "    '$defName': Created release definition." -Level "SUCCESS"
+                $migrated++
+            }
+            else {
+                Write-MigrationLog -Message "    '$defName': Skipped — could not build definition." -Level "WARN"
+                $skipped++
+            }
+        }
+        catch {
+            Write-MigrationLog -Message "    Failed to migrate release definition '$defName': $_" -Level "ERROR"
+            $failed++
+        }
+    }
+
+    Write-MigrationLog -Message "  Release definitions: $migrated migrated, $skipped skipped, $failed failed." -Level "SUCCESS"
+    return @{ Migrated = $migrated; Failed = $failed; Skipped = $skipped }
+}
+
+function Get-RmBaseUrl {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [string]$BaseUrl
+    )
+
+    # ADO Services: https://dev.azure.com/org → https://vsrm.dev.azure.com/org
+    # ADO Server on-prem: same base URL (RM is part of the same server)
+    if ($BaseUrl -match "^https://dev\.azure\.com/") {
+        return $BaseUrl -replace "^https://dev\.azure\.com/", "https://vsrm.dev.azure.com/"
+    }
+    return $BaseUrl
+}
+
+function Build-ReleaseDefinition {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        $SourceDef,
+
+        [Parameter(Mandatory)]
+        [string]$SourceProject,
+
+        [Parameter(Mandatory)]
+        [string]$DestProject,
+
+        [Parameter(Mandatory)]
+        [hashtable]$Destination
+    )
+
+    $dstProjectId = Get-DestProjectIdForPipeline -Destination $Destination -ProjectName $DestProject
+
+    # Clean up environments — remove IDs and approval identities that won't exist
+    $environments = @()
+    $rank = 1
+    foreach ($env in $SourceDef.environments) {
+        $cleanEnv = @{
+            name                = $env.name
+            rank                = $rank
+            deployPhases        = $env.deployPhases
+            retentionPolicy     = $env.retentionPolicy
+            preDeployApprovals  = @{ approvals = @(@{ isAutomated = $true; rank = 1 }) }
+            postDeployApprovals = @{ approvals = @(@{ isAutomated = $true; rank = 1 }) }
+            conditions          = @()
+        }
+
+        # Add trigger condition for environments after the first
+        if ($rank -gt 1) {
+            $cleanEnv.conditions = @(@{
+                conditionType = "environmentState"
+                name          = $environments[-1].name
+                value         = "4" # succeeded
+            })
+        }
+        else {
+            $cleanEnv.conditions = @(@{
+                conditionType = "event"
+                name          = "ReleaseStarted"
+                value         = ""
+            })
+        }
+
+        $environments += $cleanEnv
+        $rank++
+    }
+
+    # Rewrite artifacts — map to destination build definitions by name
+    $artifacts = @()
+    foreach ($artifact in $SourceDef.artifacts) {
+        if ($artifact.type -eq "Build") {
+            # Try to find matching build def in destination
+            $dstEncoded = [Uri]::EscapeDataString($DestProject)
+            try {
+                $dstBuildDefs = (Invoke-AdoApi -Url "$($Destination.BaseUrl)/$dstEncoded/_apis/build/definitions?api-version=$($Destination.ApiVersion)" -AuthHeader $Destination.AuthHeader).value
+                $matchingDef = $dstBuildDefs | Where-Object { $_.name -eq $artifact.definitionReference.definition.name } | Select-Object -First 1
+                if ($matchingDef) {
+                    $artifacts += @{
+                        alias               = $artifact.alias
+                        type                = "Build"
+                        definitionReference = @{
+                            project    = @{ id = $dstProjectId; name = $DestProject }
+                            definition = @{ id = "$($matchingDef.id)"; name = $matchingDef.name }
+                        }
+                        isPrimary           = $artifact.isPrimary
+                    }
+                }
+                else {
+                    Write-MigrationLog -Message "      Could not find matching build def for artifact '$($artifact.alias)'" -Level "WARN"
+                }
+            }
+            catch {
+                Write-MigrationLog -Message "      Error mapping artifact '$($artifact.alias)': $_" -Level "WARN"
+            }
+        }
+    }
+
+    return @{
+        name         = $SourceDef.name
+        description  = "$($SourceDef.description) [Migrated from $SourceProject]"
+        environments = $environments
+        artifacts    = $artifacts
+        variables    = $SourceDef.variables
+        triggers     = @()
+    }
+}
+
+Export-ModuleMember -Function Copy-BuildDefinitions, Copy-ReleaseDefinitions
